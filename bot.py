@@ -96,6 +96,8 @@ class Enemy:
         return 1.0 + 0.05 * self.cubes
 
     def center(self) -> Vec3:
+        if self.kind == "npc":
+            return (self.pos[0], self.pos[1], self.pos[2] + 1.75)
         return (self.pos[0], self.pos[1], self.pos[2] + 4.5 * self.scale)
 
 
@@ -108,6 +110,7 @@ class Bot:
     FINISH_HP = 260.0
     GUN_TOL_M = 2.4
     CUBE_GREED = 45.0
+    MULTI_COVER = True
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -592,17 +595,23 @@ class Bot:
     def _find_cover(self, obs: dict, enemy: Optional[Enemy]) -> Optional[Vec2]:
         if enemy is None:
             return None
-        if self.cover_target is not None and self.t - self.cover_t < 2.0:
+        if self.cover_target is not None and self.t - self.cover_t < 1.5:
             if self.cover_threat is not None and math.hypot(enemy.pos[0] - self.cover_threat[0], enemy.pos[1] - self.cover_threat[1]) < 25.0:
                 return self.cover_target
-        center, radius, ncenter, nradius, ss, se, dps = self._zone_info(obs)
-        cp = self.world.cover_point(self.self_pos, enemy.pos, 22.0, center, radius)
-        if cp is not None:
-            self.cover_target = cp
-            self.cover_t = self.t
-            self.cover_threat = enemy.pos
-            return cp
-        return None
+        center, radius = self._zone_info(obs)[:2]
+        x, y = self.self_pos[0], self.self_pos[1]
+        threats = sorted((e for e in self.enemies.values()
+                          if e.kind == "mech" and self.t - e.last_t < 1.0 and math.hypot(e.pos[0] - x, e.pos[1] - y) < 220.0),
+                         key=lambda e: math.hypot(e.pos[0] - x, e.pos[1] - y))
+        cp = None
+        if self.MULTI_COVER and len(threats) >= 2:
+            cp = self.world.cover_point_multi(self.self_pos, [e.pos for e in threats], center, radius)
+        if cp is None:
+            cp = self.world.cover_point(self.self_pos, enemy.pos, 22.0, center, radius)
+        self.cover_t = self.t
+        self.cover_threat = enemy.pos
+        self.cover_target = cp
+        return cp
 
     # ------------------------------------------------------------------ movement
     def _plan(self, goal: Vec2, force: bool = False) -> None:
@@ -693,9 +702,17 @@ class Bot:
 
         # Flee: run away from the threat, but do not leave the zone.
         if mode == "flee" and enemy is not None and (goal is None or goal[2] == "flee"):
-            ex, ey = enemy.pos[0], enemy.pos[1]
-            ux, uy = unit(x - ex, y - ey)
-            d = (ux, uy)
+            ax = ay = 0.0
+            for e in self.enemies.values():
+                if e.kind != "mech" or self.t - e.last_t > 1.0:
+                    continue
+                dd = math.hypot(x - e.pos[0], y - e.pos[1])
+                if dd < 220.0:
+                    ux, uy = unit(x - e.pos[0], y - e.pos[1])
+                    w = 1.0 / max(20.0, dd)
+                    ax += ux * w
+                    ay += uy * w
+            d = unit(ax, ay) if (ax or ay) else unit(x - enemy.pos[0], y - enemy.pos[1])
 
         # Dodge incoming projectiles / lasers.
         dodge, dodge_urgent = self._dodge(obs)
@@ -861,9 +878,8 @@ class Bot:
                 best = (e, d, los)
         if best is None:
             self.combat_target = None
-            # Release a charged laser instead of letting it auto-fire at nothing.
             self.laser_charging = False
-            return None, (False, False)
+            return self._shoot_pve(obs, mode)
         target, d, los = best
         self.combat_target = target.id
 
@@ -938,6 +954,47 @@ class Bot:
             if err < tol:
                 fire0 = True
         return aim, (fire0, fire1)
+
+    def _shoot_pve(self, obs: dict, mode: str) -> Tuple[Optional[Vec2], Tuple[bool, bool]]:
+        """No mech in sight: shoot NPC drones (they shoot back) and the crate we are farming."""
+        x, y, z = self.self_pos
+        muzzle = (x, y, z + self.muzzle_h)
+        tgt = None
+        best = 1e18
+        for e in self.enemies.values():
+            if e.kind != "npc" or self.t - e.last_t > 0.35:
+                continue
+            d = math.hypot(e.pos[0] - x, e.pos[1] - y)
+            if d > 120.0:
+                continue
+            if not self.world.line_of_sight(muzzle, e.center()):
+                continue
+            sc = d - (60.0 if self.t - self.last_damage_t < 1.5 else 0.0)
+            if sc < best:
+                best = sc
+                tgt = (e.pos[0], e.pos[1], e.pos[2] + 1.75, e.vel, d)
+        if tgt is None and self.goal is not None and self.goal[2] == "crate":
+            for c in obs.get("crates") or ():
+                if int(c["id"]) != self.goal[3]:
+                    continue
+                cx_, cy_, cz_ = c["pos"]
+                d = math.hypot(cx_ - x, cy_ - y)
+                if d < 110.0 and self.world.line_of_sight(muzzle, (cx_, cy_, cz_ + 0.8)):
+                    tgt = (cx_, cy_, cz_ + 0.8, (0.0, 0.0, 0.0), d)
+        if tgt is None:
+            return None, (False, False)
+        tx, ty, tz, vel, d = tgt
+        tf = d / max(1.0, float(self.gun.get("speed", 252.0)))
+        px, py = tx + vel[0] * tf, ty + vel[1] * tf
+        yaw = math.atan2(py - y, px - x)
+        pitch = clamp(math.atan2(tz - (z + self.muzzle_h), max(1.0, math.hypot(px - x, py - y))), self.min_pitch, self.max_pitch)
+        fire0 = self._gun_ready() and self._aim_error(yaw, pitch) < clamp(math.atan2(1.4, max(8.0, d)), 0.006, 0.08)
+        fire1 = False
+        sec = self.weapons[1] if len(self.weapons) > 1 else None
+        if sec is not None and sec.get("kind") == "lightning" and d < 40.0 and self.energy > 30.0 \
+                and abs(angle_diff(self.self_aim[0], yaw)) < 0.2:
+            fire1 = True
+        return (yaw, pitch), (fire0, fire1)
 
     def _mortar_clear(self, aim: Vec2) -> bool:
         """The first 25 m of the shell's arc must not run into a wall."""

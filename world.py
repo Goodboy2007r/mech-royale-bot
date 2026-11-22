@@ -522,3 +522,37 @@ class World:
             if self.segment_blocked((ex, ey, ez), (x, y, z + 4.5)):
                 return (x, y)
         return None
+
+    def cover_point_multi(self, me: Vec3, threats: Sequence[Vec3], zone_center: Vec2 = (0.0, 0.0),
+                          zone_radius: float = 1e9) -> Optional[Vec2]:
+        """Nearby walkable point seen by as few of `threats` as possible (ties: closest, away from them)."""
+        if not threats:
+            return None
+        mx, my = me[0], me[1]
+        eyes = [(t[0], t[1], t[2] + 8.0) for t in threats[:4]]
+        cx = sum(e[0] for e in eyes) / len(eyes)
+        cy = sum(e[1] for e in eyes) / len(eyes)
+        away = math.atan2(my - cy, mx - cx)
+        best = None
+        best_cost = 1e18
+        here = sum(1 for e in eyes if self.fast_los(e, (mx, my, 0.0)))
+        for i in range(16):
+            ang = i * (2.0 * math.pi / 16.0)
+            da = abs(math.atan2(math.sin(ang - away), math.cos(ang - away)))
+            for rr in (10.0, 20.0, 32.0):
+                x = mx + math.cos(ang) * rr
+                y = my + math.sin(ang) * rr
+                if math.hypot(x - zone_center[0], y - zone_center[1]) > zone_radius - 4:
+                    continue
+                if not self.nav.is_free_xy(x, y):
+                    continue
+                if not self.nav.line_free((mx, my), (x, y), step=2.5):
+                    continue
+                exposed = sum(1 for e in eyes if self.fast_los(e, (x, y, 0.0)))
+                cost = exposed * 100.0 + rr * 0.8 + da * 12.0
+                if cost < best_cost:
+                    best_cost = cost
+                    best = (x, y, exposed)
+        if best is None or best[2] >= here:
+            return None
+        return (best[0], best[1])
