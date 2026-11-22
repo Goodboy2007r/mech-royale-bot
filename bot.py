@@ -111,6 +111,7 @@ class Bot:
     GUN_TOL_M = 2.4
     CUBE_GREED = 45.0
     MULTI_COVER = True
+    SAFE_SPOT = True
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -208,6 +209,9 @@ class Bot:
         self.last_boost_t = -100.0
         self.scan_phase = 0.0
         self.final_goal: Optional[Vec2] = None
+        self.safe_spot: Optional[Vec2] = None
+        self.safe_spot_t = -100.0
+        self.enemy_memory: Dict[int, Tuple[Vec3, float]] = {}
         self.climb: Optional[dict] = None
         self.climb_since = 0.0
         self.start_t = 0.0
@@ -316,6 +320,7 @@ class Bot:
                 e.update(m, t)
             if m.get("kind") == "mech":
                 self.last_seen_enemy_t = t
+                self.enemy_memory[mid] = (tuple(m["pos"]), t)
         # forget stale memories
         for mid in list(self.enemies):
             e = self.enemies[mid]
@@ -411,6 +416,10 @@ class Bot:
                 return ncenter, "zone_next"
             # already comfortably inside the next circle: hold near its centre
             return ncenter, "zone_hold"
+        if self.SAFE_SPOT and radius > 80.0:
+            spot = self._safe_spot(obs)
+            if spot is not None:
+                return spot, "patrol"
         # Early game: stay near the current centre but with a little offset so we are not a fixed target.
         if radius > 80.0:
             # choose a point inside the current circle, biased toward the next centre
@@ -421,6 +430,39 @@ class Bot:
             if dist((px, py), center) < radius - 20.0:
                 return (px, py), "patrol"
         return center, "zone_hold"
+
+    def _safe_spot(self, obs: dict) -> Optional[Vec2]:
+        """A walkable point well inside the next circle, far from where enemies were last seen."""
+        if self.safe_spot is not None and self.t - self.safe_spot_t < 6.0:
+            return self.safe_spot
+        center, radius, ncenter, nradius = self._zone_info(obs)[:4]
+        x, y = self.self_pos[0], self.self_pos[1]
+        known = [p for (p, t0) in self.enemy_memory.values() if self.t - t0 < 40.0]
+        r_in = max(15.0, min(nradius, radius) - 30.0)
+        best = None
+        best_s = -1e18
+        for ring in (0.0, 0.35, 0.65, 0.9):
+            n = 1 if ring == 0.0 else 12
+            for i in range(n):
+                a = i * TAU / n + 0.3 * ring
+                px = ncenter[0] + math.cos(a) * r_in * ring
+                py = ncenter[1] + math.sin(a) * r_in * ring
+                if math.hypot(px - center[0], py - center[1]) > radius - 25.0:
+                    continue
+                if not self.world.nav.is_free_xy(px, py):
+                    q = self.world.nav.nearest_free(px, py, 15.0)
+                    if q is None:
+                        continue
+                    px, py = q
+                md = min([math.hypot(px - k[0], py - k[1]) for k in known] or [250.0])
+                travel = math.hypot(px - x, py - y)
+                sc = min(md, 250.0) - 0.25 * travel
+                if sc > best_s:
+                    best_s = sc
+                    best = (px, py)
+        self.safe_spot = best
+        self.safe_spot_t = self.t
+        return best
 
     def _threat_summary(self) -> Tuple[Optional[Enemy], float, int, int]:
         """Nearest visible mech, its distance, count within 120 m, count within 60 m."""
