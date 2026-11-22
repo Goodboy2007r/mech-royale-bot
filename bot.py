@@ -104,6 +104,10 @@ class Bot:
     FIGHT_RANGE = 65.0
     FIGHT_RANGE_LIGHTNING = 90.0
     FLEE_HP = 0.42
+    HOLD_FIRE_FLEE = False
+    FINISH_HP = 260.0
+    GUN_TOL_M = 2.4
+    CUBE_GREED = 45.0
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -252,6 +256,11 @@ class Bot:
 
         # Aim and fire.
         aim, fire = self._combat(obs, mode)
+        if mode == "flee" and self.HOLD_FIRE_FLEE and self.t - self.last_damage_t > 1.0:
+            tgt = self.enemies.get(self.combat_target) if self.combat_target is not None else None
+            if tgt is None or tgt.hp > self.FINISH_HP:
+                # Dealing damage resets the regen timer: stay quiet and heal.
+                fire = (False, fire[1] and self.laser_charging)
         if aim is None:
             aim = self._scan_aim(obs, move)
         action["move"] = [float(move[0]), float(move[1])]
@@ -474,6 +483,20 @@ class Bot:
                 return "flee", (cover[0], cover[1], "cover", None)
             return "rotate", (zx, zy, "zone", None)
 
+        # 4b. Cubes lying close by (usually from a kill) are worth grabbing even in a fight.
+        if self.CUBE_GREED > 0 and self.cubes < 10 and hp_frac > 0.3:
+            center, radius = self._zone_info(obs)[:2]
+            bc = None
+            bd = self.CUBE_GREED
+            for c in obs.get("cubes") or ():
+                cx_, cy_ = float(c["pos"][0]), float(c["pos"][1])
+                dd = math.hypot(cx_ - x, cy_ - y)
+                if dd < bd and math.hypot(cx_ - center[0], cy_ - center[1]) < radius - 5.0:
+                    bd = dd
+                    bc = (cx_, cy_, "cube", int(c["id"]))
+            if bc is not None:
+                return "loot", bc
+
         # 5. A single enemy in comfortable range: fight only if it is worth it, otherwise keep moving.
         if enemy is not None and edist < 170.0:
             e_hp = enemy.hp / max(1.0, enemy.max_hp)
@@ -547,12 +570,10 @@ class Bot:
             kind = p.get("kind")
             if kind not in ("laser", "lightning", "mortar"):
                 continue
-            if sec is not None:
-                # swap only mortar -> laser/lightning, and only when safe
-                if not (sec.get("kind") == "mortar" and kind in ("laser", "lightning")):
-                    continue
-            pref = {"laser": 110.0, "lightning": 100.0, "mortar": 70.0}.get(kind, 50.0)
-            consider(float(p["pos"][0]), float(p["pos"][1]), "pickup", int(p["id"]), pref, 150.0)
+            if not self._want_weapon(kind):
+                continue
+            pref = {"laser": 170.0, "lightning": 90.0, "mortar": 70.0}.get(kind, 50.0)
+            consider(float(p["pos"][0]), float(p["pos"][1]), "pickup", int(p["id"]), pref, 200.0 if kind == "laser" else 140.0)
 
         # Cubes.
         if cube_value > 0:
@@ -913,7 +934,7 @@ class Bot:
 
         if gun_ok and los:
             err = self._aim_error(gun_aim[0], gun_aim[1])
-            tol = clamp(math.atan2(2.4, max(12.0, d)), 0.008, 0.07)
+            tol = clamp(math.atan2(self.GUN_TOL_M, max(12.0, d)), 0.008, 0.07)
             if err < tol:
                 fire0 = True
         return aim, (fire0, fire1)
@@ -1055,12 +1076,9 @@ class Bot:
             px, py, pz = p["pos"]
             if math.hypot(px - x, py - y) > reach or abs(pz - z) > 4.0:
                 continue
-            if sec is not None:
-                if not (sec.get("kind") == "mortar" and kind in ("laser", "lightning")):
-                    continue
-                score = {"laser": 3.0, "lightning": 2.0, "mortar": 0.0}.get(kind, 0.0)
-            else:
-                score = {"laser": 3.0, "lightning": 2.5, "mortar": 1.0}.get(kind, 0.0)
+            if not self._want_weapon(kind):
+                continue
+            score = {"laser": 3.0, "lightning": 2.5, "mortar": 1.0}.get(kind, 0.0)
             if score > best_score:
                 best_score = score
                 best = p
@@ -1070,6 +1088,18 @@ class Bot:
         if sec is not None:
             drop = 1
         return int(best["id"]), drop
+
+    WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 1}
+
+    def _want_weapon(self, kind: str) -> bool:
+        if kind not in self.WEAPON_RANK:
+            return False
+        sec = self.weapons[1] if len(self.weapons) > 1 else None
+        if sec is None:
+            return True
+        if sec.get("kind") == "laser" and float(sec.get("charge", 0.0)) > 0.0:
+            return False
+        return self.WEAPON_RANK[kind] > self.WEAPON_RANK.get(sec.get("kind"), 0)
 
     def _choose_upgrade(self, offer: dict) -> int:
         oid = offer.get("id")
