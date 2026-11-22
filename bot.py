@@ -101,6 +101,9 @@ class Enemy:
 
 class Bot:
     name = "survivor"
+    FIGHT_RANGE = 65.0
+    FIGHT_RANGE_LIGHTNING = 90.0
+    FLEE_HP = 0.42
 
     def __init__(self, hello: mf.Hello):
         self.cfg = hello["config"]
@@ -448,7 +451,7 @@ class Bot:
             return "final", (zx, zy, "final", None)
 
         # 3. Low health: disengage and heal.
-        if hp_frac < 0.42 and edist < 190.0:
+        if hp_frac < self.FLEE_HP and edist < 190.0:
             cover = self._find_cover(obs, enemy)
             if cover is not None:
                 return "flee", (cover[0], cover[1], "cover", None)
@@ -654,9 +657,9 @@ class Bot:
             ddx, ddy = x - ex, y - ey
             ed = math.hypot(ddx, ddy)
             ux, uy = unit(ddx, ddy)
-            desired = 65.0
+            desired = self.FIGHT_RANGE
             if "lightning" in enemy.weapons:
-                desired = 90.0
+                desired = max(self.FIGHT_RANGE, self.FIGHT_RANGE_LIGHTNING)
             radial = 0.0
             if ed < desired - 8.0:
                 radial = -1.0  # back away
@@ -696,14 +699,14 @@ class Bot:
         move = (d[0] * speed, d[1] * speed)
 
         # Stuck detection: if we have been trying to move but haven't, jump and replan.
-        if now - self.last_move_t > 0.6:
+        if self.t - self.last_move_t > 0.6:
             moved = math.hypot(x - self.last_move_pos[0], y - self.last_move_pos[1])
             if self.last_move_t > 0 and moved < 0.6 and math.hypot(self.last_move_cmd[0], self.last_move_cmd[1]) > 0.3:
                 self.stuck_count += 1
             else:
                 self.stuck_count = max(0, self.stuck_count - 1)
             self.last_move_pos = (x, y, z)
-            self.last_move_t = now
+            self.last_move_t = self.t
             self.last_move_cmd = move
 
         boost = False
@@ -811,111 +814,126 @@ class Bot:
 
     # ------------------------------------------------------------------ aiming / firing
     def _combat(self, obs: dict, mode: str) -> Tuple[Optional[Vec2], Tuple[bool, bool]]:
-        fire = [False, False]
         x, y, z = self.self_pos
-        enemy, edist, n120, n60 = self._threat_summary()
-        target = None
-        if enemy is not None and self.t - enemy.last_t <= self.memory_s + 1.0:
-            target = enemy
-        # Prefer a visible, low-HP enemy within range.
+        muzzle = (x, y, z + self.muzzle_h)
+        # Candidate targets: every mech the server tells us about (memory entries are real positions).
         best = None
         best_score = 1e18
         for e in self.enemies.values():
             if e.kind != "mech" or self.t - e.last_t > 0.35:
                 continue
             d = math.hypot(e.pos[0] - x, e.pos[1] - y)
-            if d > 260.0:
+            if d > 280.0:
                 continue
-            hp_frac = e.hp / max(1.0, e.max_hp)
-            score = d + hp_frac * 120.0
+            los = self.world.line_of_sight(muzzle, e.center())
+            score = d + (e.hp / max(1.0, e.max_hp)) * 90.0 + e.hp * 0.03
+            if not los:
+                score += 400.0
+            if e.id == self.combat_target:
+                score -= 35.0
             if "lightning" in e.weapons and d < 55.0:
-                score -= 60.0
-            if e.charging:
                 score -= 40.0
+            if e.charging:
+                score -= 30.0
             if score < best_score:
                 best_score = score
-                best = e
-        if best is not None:
-            target = best
-        if target is None:
+                best = (e, d, los)
+        if best is None:
+            self.combat_target = None
+            # Release a charged laser instead of letting it auto-fire at nothing.
             self.laser_charging = False
             return None, (False, False)
-
-        # If the target is far and behind cover, keep the aim on it but don't waste ammo.
-        eye = (x, y, z + self.eye_h)
-        tcenter = target.center()
-        los = self.world.line_of_sight(eye, tcenter)
-        d = math.hypot(target.pos[0] - x, target.pos[1] - y)
+        target, d, los = best
+        self.combat_target = target.id
 
         sec = self.weapons[1] if len(self.weapons) > 1 else None
         sec_kind = sec.get("kind") if sec else None
+        gun_aim = self._aim_point(target, "gun", d)
+        gun_range = float(self.gun.get("range", 230.0))
+        gun_ok = self._gun_ready() and d <= gun_range * 0.98
+        fire0 = False
+        fire1 = False
+        aim = gun_aim
 
-        # Choose the best weapon for the range.
-        want_gun = False
-        want_sec = False
-        if d <= float(self.gun.get("range", 230.0)) * 0.98:
-            want_gun = True
-        if sec is not None:
-            if sec_kind == "laser" and d <= float(sec["stats"].get("range", 280.0)) * 0.98:
-                want_sec = True
-            elif sec_kind == "lightning" and d <= float(sec["stats"].get("range", 45.0)) * 0.95:
-                want_sec = True
-            elif sec_kind == "mortar" and 28.0 <= d <= 225.0:
-                want_sec = True
-
-        # Aim point.
-        aim = self._aim_point(target, sec_kind if want_sec else "gun", d)
-        if aim is None:
-            self.laser_charging = False
-            return None, (False, False)
-        desired_yaw, desired_pitch = aim
-
-        # Fire decisions.
-        if want_gun and los and self._gun_ready():
-            err = self._aim_error(desired_yaw, desired_pitch)
-            # tolerance in radians: about 2.5 m at the target distance
-            tol = clamp(math.atan2(2.6, max(12.0, d)), 0.008, 0.07)
-            if err < tol:
-                fire[0] = True
-
-        if want_sec and los and sec is not None:
-            stats = sec["stats"]
-            if sec_kind == "laser":
-                cooldown = float(sec.get("cooldown", 0.0))
-                charge = float(sec.get("charge", 0.0))
-                if cooldown <= 0.01:
-                    err = self._aim_error(desired_yaw, desired_pitch)
-                    if err < 0.045 and mode not in ("flee",):
-                        if charge < float(stats.get("charge", 0.75)) * 0.96:
-                            fire[1] = True
-                            self.laser_charging = True
-                        else:
-                            fire[1] = False
-                            self.laser_charging = False
-                    elif charge >= 0.12:
-                        # release before we lose the shot
-                        fire[1] = False
-                        self.laser_charging = False
-                    else:
-                        self.laser_charging = False
+        if sec_kind == "laser":
+            st = sec["stats"]
+            charge = float(sec.get("charge", 0.0))
+            full = float(st.get("charge", 0.75))
+            ready = float(sec.get("cooldown", 0.0)) <= 0.01
+            laser_aim = self._aim_point(target, "laser", d)
+            if los and d <= float(st.get("range", 280.0)) * 0.97 and (ready or charge > 0.0) and mode != "flee_hard":
+                aim = laser_aim
+                err = self._aim_error(*laser_aim)
+                tol = clamp(math.atan2(2.0, max(10.0, d)), 0.006, 0.08)
+                if charge < full * 0.97:
+                    fire1 = True  # keep charging
+                elif err > tol and charge < full + float(st.get("hold_s", 2.0)) * 0.8:
+                    fire1 = True  # hold until on target
                 else:
-                    self.laser_charging = False
-            elif sec_kind == "lightning":
-                if self.energy >= 4.0:
-                    err = self._aim_error(desired_yaw, desired_pitch)
-                    if err < math.radians(14.0):
-                        fire[1] = True
-            elif sec_kind == "mortar":
-                cooldown = float(sec.get("cooldown", 0.0))
-                if cooldown <= 0.01 and d > 28.0:
-                    err = self._aim_error(desired_yaw, desired_pitch)
-                    if err < 0.05:
-                        fire[1] = True
+                    fire1 = False  # release: fires now
+                self.laser_charging = fire1
+            elif charge > 0.0:
+                # Lost the shot while charging: keep holding a little so the beam is not wasted.
+                aim = laser_aim
+                fire1 = charge < full + float(st.get("hold_s", 2.0)) * 0.6
+                self.laser_charging = fire1
+            else:
+                self.laser_charging = False
+        elif sec_kind == "lightning":
+            self.laser_charging = False
+            st = sec["stats"]
+            if los and d <= float(st.get("range", 45.0)) * 0.93 and self.energy >= float(st.get("energy", 3.0)) + 1.0 \
+                    and float(sec.get("cooldown", 0.0)) <= 0.01:
+                yerr = abs(angle_diff(self.self_aim[0], gun_aim[0]))
+                if yerr < math.radians(float(st.get("cone_deg", 30.0))) * 0.4:
+                    fire1 = True
+        elif sec_kind == "mortar":
+            self.laser_charging = False
+            ready = float(sec.get("cooldown", 0.0)) <= 0.01
+            if ready and 32.0 <= d <= 225.0 and (not los or not gun_ok):
+                v = float(self.mortar.get("speed", 72.0))
+                maim = None
+                for high in ((False, True) if los else (True,)):
+                    a0 = self._mortar_aim(target.pos[0], target.pos[1], target.pos[2] + 1.0, d, high)
+                    if a0 is None:
+                        continue
+                    tof = d / max(1.0, v * math.cos(a0[1]))
+                    lx = target.pos[0] + target.vel[0] * tof * 0.8
+                    ly = target.pos[1] + target.vel[1] * tof * 0.8
+                    a1 = self._mortar_aim(lx, ly, target.pos[2] + 1.0, math.hypot(lx - x, ly - y), high)
+                    if a1 is not None and self._mortar_clear(a1):
+                        maim = a1
+                        break
+                if maim is not None:
+                    aim = maim
+                    if self._aim_error(*maim) < 0.03:
+                        fire1 = True
         else:
             self.laser_charging = False
 
-        # Keep facing the target even when not firing; this protects the front arc.
-        return (desired_yaw, desired_pitch), (fire[0], fire[1])
+        if gun_ok and los:
+            err = self._aim_error(gun_aim[0], gun_aim[1])
+            tol = clamp(math.atan2(2.4, max(12.0, d)), 0.008, 0.07)
+            if err < tol:
+                fire0 = True
+        return aim, (fire0, fire1)
+
+    def _mortar_clear(self, aim: Vec2) -> bool:
+        """The first 25 m of the shell's arc must not run into a wall."""
+        x, y, z = self.self_pos
+        yaw, pitch = aim
+        v = float(self.mortar.get("speed", 72.0))
+        g = float(self.mortar.get("gravity", 22.0))
+        p0 = (x, y, z + self.height + 0.5)
+        prev = p0
+        for i in range(1, 6):
+            t = i * 0.12
+            h = v * math.cos(pitch) * t
+            pt = (x + math.cos(yaw) * h, y + math.sin(yaw) * h, p0[2] + v * math.sin(pitch) * t - 0.5 * g * t * t)
+            if self.world.segment_blocked(prev, pt):
+                return False
+            prev = pt
+        return True
 
     def _gun_ready(self) -> bool:
         w = self.weapons[0] if self.weapons else None
@@ -952,7 +970,7 @@ class Bot:
             return self._mortar_aim(tx, ty, tz + 2.0 * scale, d)
         return None
 
-    def _mortar_aim(self, tx: float, ty: float, tz: float, d: float) -> Optional[Vec2]:
+    def _mortar_aim(self, tx: float, ty: float, tz: float, d: float, high: bool = False) -> Optional[Vec2]:
         x, y, z = self.self_pos
         muzzle = z + self.muzzle_h + 2.5
         v = float(self.mortar.get("speed", 72.0))
@@ -971,7 +989,7 @@ class Bot:
             root = math.sqrt(disc)
             u1 = (vv - root) / (g * d)
             u2 = (vv + root) / (g * d)
-            u = u1 if u1 > 0.05 else u2
+            u = u2 if high else (u1 if u1 > 0.05 else u2)
             pitch = math.atan(u)
             if pitch < self.min_pitch or pitch > self.max_pitch:
                 return None
